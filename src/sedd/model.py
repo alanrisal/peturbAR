@@ -36,6 +36,7 @@ class SinusoidalEmbedding(nn.Module):
         return embedding
 
 
+
 class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding (RoPE)."""
 
@@ -74,7 +75,7 @@ class MultiHeadAttention(nn.Module):
         hidden_dim: int,
         num_heads: int,
         dropout: float = 0.0,
-        use_rotary: bool = True,
+        use_rotary: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -95,6 +96,7 @@ class MultiHeadAttention(nn.Module):
         self,
         x: Tensor,
         mask: Optional[Tensor] = None,
+        attn_bias: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
@@ -129,7 +131,11 @@ class MultiHeadAttention(nn.Module):
             attn_mask = attn_mask.expand(batch_size, 1, seq_len, seq_len)
             # Convert boolean mask to additive mask (0 for attend, -inf for mask)
             attn_mask = torch.where(attn_mask == 0, float('-inf'), 0.0)
-
+       
+        if attn_bias is not None:
+            bias = attn_bias.unsqueeze(0).unsqueeze(0)   # [1, 1, N, N]
+            attn_mask = bias if attn_mask is None else attn_mask + bias
+        
         # Use PyTorch's memory-efficient Flash Attention
         out = F.scaled_dot_product_attention(
             q, k, v,
@@ -162,7 +168,53 @@ class FeedForward(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
 
+class CrossAttentionConditioningBlock(nn.Module):
+    """
+    There currently isnt any way to create gene specific responses across genes
+    This makes each gene token listen to the context vector 
+    hence gene-specific responses will occur instead of a uniform scale/shift
+    """
+    def __init__ (self, hidden_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
 
+        #Genes = queries and pertubation context is keys
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = dropout
+    
+    def forward(self, x: Tensor, context: Tensor) -> Tensor:
+        """
+        x: [B, n_genes, hidden_dim]
+        context: [B, hidden_dim]
+        """
+
+        B, N, D = x.shape
+
+        ctx = context.unsqueeze(1)
+
+        q = self.q_proj(self.norm(x))                          # [B, N, D]
+        k = self.k_proj(ctx)                                   # [B, 1, D]
+        v = self.v_proj(ctx)                                   # [B, 1, D]
+        
+        # Reshape for multi-head
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Each gene attends to the single perturbation context token
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False
+        )
+        
+        out = out.transpose(1, 2).contiguous().view(B, N, D)
+        return self.out_proj(out)
 class AdaptiveLayerNorm(nn.Module):
     """Adaptive Layer Normalization conditioned on time embedding.
 
@@ -716,49 +768,21 @@ class SeparateFiLMAdaptiveLayerNorm(nn.Module):
 
         return h
 
-
-class SeparateFiLMTransformerBlock(nn.Module):
     """Transformer block with separate FiLM conditioning for each signal type."""
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        ff_dim: int,
-        dropout: float = 0.0,
-        has_cell_type: bool = False,
-    ):
+class SeparateFiLMTransformerBlock(nn.Module):
+    def __init__(self, hidden_dim, num_heads, ff_dim, dropout=0.0, has_cell_type=False):
         super().__init__()
         self.attn_norm = SeparateFiLMAdaptiveLayerNorm(hidden_dim, has_cell_type)
-        self.attn = MultiHeadAttention(hidden_dim, num_heads, dropout)
+        self.attn = MultiHeadAttention(hidden_dim, num_heads, dropout, use_rotary=False)
         self.ff_norm = SeparateFiLMAdaptiveLayerNorm(hidden_dim, has_cell_type)
         self.ff = FeedForward(hidden_dim, ff_dim, dropout)
 
-    def forward(
-        self,
-        x: Tensor,
-        time_cond: Tensor,
-        pert_cond: Tensor,
-        cell_type_cond: Optional[Tensor] = None,
-        mask: Optional[Tensor] = None,
-    ) -> Tensor:
-        """
-        Args:
-            x: Input [batch, seq_len, hidden_dim]
-            time_cond: Time conditioning [batch, hidden_dim]
-            pert_cond: Perturbation conditioning [batch, hidden_dim]
-            cell_type_cond: Optional cell type conditioning [batch, hidden_dim]
-            mask: Optional attention mask
-
-        Returns:
-            Output [batch, seq_len, hidden_dim]
-        """
-        # Self-attention with residual
-        x = x + self.attn(self.attn_norm(x, time_cond, pert_cond, cell_type_cond), mask)
-        # Feed-forward with residual
+    def forward(self, x, time_cond, pert_cond, cell_type_cond=None, mask=None, attn_bias: Optional[Tensor] = None):
+        x = x + self.attn(
+            self.attn_norm(x, time_cond, pert_cond, cell_type_cond), mask, attn_bias
+        )
         x = x + self.ff(self.ff_norm(x, time_cond, pert_cond, cell_type_cond))
         return x
-
 
 class SEDDPerturbationTransformerSeparateFiLM(nn.Module):
     """SEDD Transformer with separate FiLM conditioning for each label type.
@@ -815,7 +839,7 @@ class SEDDPerturbationTransformerSeparateFiLM(nn.Module):
         self.num_perturbations = num_perturbations
         self.precomputed_emb_dim = precomputed_emb_dim
         self.num_cell_types = num_cell_types
-
+        
         ff_dim = int(hidden_dim * ff_mult)
         has_cell_type = num_cell_types is not None and num_cell_types > 0
 
@@ -867,6 +891,16 @@ class SEDDPerturbationTransformerSeparateFiLM(nn.Module):
             for _ in range(num_layers)
         ])
 
+        self.ctrl_embed = nn.Embedding(self.vocab_size, hidden_dim)
+        self.ctrl_gate = nn.Parameter(torch.full((1,), -5.0))  # sigmoid(-5) ≈ 0.007, near-zero initial influence
+        self.cross_attn_blocks = nn.ModuleList([
+            CrossAttentionConditioningBlock(hidden_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+
+# --- NEW: optional GRN attention bias (set after init via register_buffer) ---
+        self.register_buffer('attn_bias', None, persistent=True)
+
         # Output normalization and projection (also uses separate FiLM)
         self.out_norm = SeparateFiLMAdaptiveLayerNorm(hidden_dim, has_cell_type)
         self.out_proj = nn.Linear(hidden_dim, self.vocab_size, bias=False)
@@ -883,90 +917,74 @@ class SEDDPerturbationTransformerSeparateFiLM(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
 
     def forward(
-        self,
-        x: Tensor,
-        sigma: Tensor,
-        pert_labels: Tensor,
-        mask: Optional[Tensor] = None,
-        cell_type_labels: Optional[Tensor] = None,
+            self,
+            x: Tensor,
+            sigma: Tensor,
+            pert_labels: Tensor,
+            mask: Optional[Tensor] = None,
+            cell_type_labels: Optional[Tensor] = None,
+            x_control: Optional[Tensor] = None,      # ← NEW
     ) -> Tensor:
-        """
-        Args:
-            x: Input tokens [batch, seq_len]
-            sigma: Diffusion time [batch] or scalar
-            pert_labels: Perturbation labels [batch] or embeddings [batch, emb_dim]
-            mask: Optional attention mask [batch, seq_len]
-            cell_type_labels: Optional cell type labels [batch]
-
-        Returns:
-            Logits [batch, seq_len, vocab_size]
-        """
         batch_size, seq_len = x.shape
         device = x.device
 
         if sigma.dim() == 0:
             sigma = sigma.expand(batch_size)
 
-        # Token and position embeddings
+        # Token + gene position embeddings
         tok_emb = self.token_embed(x)
         pos_idx = torch.arange(seq_len, device=device)
         pos_emb = self.gene_embed(pos_idx).unsqueeze(0)
         h = tok_emb + pos_emb
 
-        # Time embedding (separate conditioning signal)
+        # ── NEW: gated control cell conditioning ──────────────────────────────
+        if x_control is not None:
+            ctrl_emb = self.ctrl_embed(x_control)           # [B, seq_len, D]
+            h = h + torch.sigmoid(self.ctrl_gate) * ctrl_emb
+        # ──────────────────────────────────────────────────────────────────────
+
+        # Time conditioning
         time_cond = self.time_embed(sigma)
 
-        # Perturbation embedding (separate conditioning signal)
+        # Perturbation conditioning
         if pert_labels.dim() == 1:
-            # pert_labels are indices, use embedding layer
             p_emb = self.pert_embed(pert_labels.long())
         else:
-            # pert_labels are already embeddings (from cond_label_lookup)
             if self.precomputed_proj is not None:
                 p_emb = self.precomputed_proj(pert_labels)
             else:
                 p_emb = pert_labels
         pert_cond = self.pert_proj(p_emb)
 
-        # Cell type embedding (separate conditioning signal, optional)
+        # Cell type conditioning
         cell_type_cond = None
         if cell_type_labels is not None and self.cell_type_embed is not None:
             ct_emb = self.cell_type_embed(cell_type_labels.long())
             cell_type_cond = self.cell_type_proj(ct_emb)
 
-        # Transformer blocks with separate FiLM conditioning
-        for block in self.blocks:
-            h = block(h, time_cond, pert_cond, cell_type_cond, mask)
+        # Context vector for cross-attention (pert + optional cell type)
+        pert_ctx = pert_cond
+        if cell_type_cond is not None:
+            pert_ctx = pert_cond + cell_type_cond
 
-        # Output with separate FiLM
+        # Transformer blocks
+        for block, cross_attn in zip(self.blocks, self.cross_attn_blocks):
+            # Self-attention with FiLM + optional GRN bias
+            h = block(h, time_cond, pert_cond, cell_type_cond, mask, self.attn_bias)
+            # Cross-attention: each gene queries the perturbation context
+            h = h + cross_attn(h, pert_ctx)
+
         h = self.out_norm(h, time_cond, pert_cond, cell_type_cond)
         logits = self.out_proj(h)
 
         return logits
 
-    def score(
-        self,
-        x: Tensor,
-        sigma: Tensor,
-        pert_labels: Tensor,
-        mask: Optional[Tensor] = None,
-        cell_type_labels: Optional[Tensor] = None,
-    ) -> Tensor:
-        """Compute log probabilities (scores) for each token."""
-        logits = self.forward(x, sigma, pert_labels, mask, cell_type_labels)
-        score = F.log_softmax(logits, dim=-1)
-        return score
+    def score(self, x, sigma, pert_labels, mask=None, cell_type_labels=None, x_control=None):
+        logits = self.forward(x, sigma, pert_labels, mask, cell_type_labels, x_control)
+        return F.log_softmax(logits, dim=-1)
 
-    def get_loss(
-        self,
-        x_perturbed: Tensor,
-        x_noised: Tensor,
-        sigma: Tensor,
-        pert_labels: Tensor,
-        graph,
-        mask: Optional[Tensor] = None,
-        cell_type_labels: Optional[Tensor] = None,
-    ) -> Tensor:
+    def get_loss(self, x_perturbed, x_noised, sigma, pert_labels, graph,
+             mask=None, cell_type_labels=None, x_control=None):
         """
         Compute perturbation prediction loss.
 
@@ -982,20 +1000,15 @@ class SEDDPerturbationTransformerSeparateFiLM(nn.Module):
         Returns:
             Cross-entropy loss at masked positions
         """
-        pred_score = self.score(x_noised, sigma, pert_labels, mask, cell_type_labels)
-
-        # Only compute loss at masked positions
+        pred_score = self.score(x_noised, sigma, pert_labels, mask, cell_type_labels, x_control)
         is_masked = (x_noised == self.mask_index)
-
         if not is_masked.any():
             return torch.tensor(0.0, device=x_perturbed.device, requires_grad=True)
-
-        pred_at_mask = pred_score[is_masked]  # [num_masked, vocab_size]
-        target_at_mask = x_perturbed[is_masked]  # [num_masked]
-
-        loss = F.cross_entropy(pred_at_mask, target_at_mask)
-
-        return loss
+        
+        pred_at_mask  = pred_score[is_masked]
+        target_at_mask = x_perturbed[is_masked]
+        
+        return F.cross_entropy(pred_at_mask, target_at_mask)
 
 
 class SEDDPerturbationTransformerSeparateFiLMSmall(SEDDPerturbationTransformerSeparateFiLM):

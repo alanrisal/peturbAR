@@ -19,6 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sedd.model import (
     SEDDPerturbationTransformerSmall,
+    SEDDPerturbationTransformerSeparateFiLMSmall,
+    SEDDPerturbationTransformerSeparateFiLMMedium,
+    SEDDPerturbationTransformerSeparateFiLMLarge,
 )
 from sedd.graph import AbsorbingGraph
 from sedd.noise import LogLinearNoise
@@ -29,6 +32,9 @@ from sedd.data import PerturbSeqDataset, train_val_split
 # Model registry for easy instantiation by name
 MODEL_REGISTRY = {
     "SEDDPerturbationTransformerSmall": SEDDPerturbationTransformerSmall,
+    "SEDDPerturbationTransformerSeparateFiLMSmall": SEDDPerturbationTransformerSeparateFiLMSmall,
+    "SEDDPerturbationTransformerSeparateFiLMMedium": SEDDPerturbationTransformerSeparateFiLMMedium,
+    "SEDDPerturbationTransformerSeparateFiLMLarge": SEDDPerturbationTransformerSeparateFiLMLarge,
 }
 
 
@@ -259,7 +265,7 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default=model_config.get("name", "SEDDPerturbationTransformerSmall"),
+        default=model_config.get("name", "SEDDPerturbationTransformerSeparateFiLMSmall"),
         choices=list(MODEL_REGISTRY.keys()),
         help="Model architecture to use (e.g., SEDDPerturbationTransformerSeparateFiLMSmall)"
     )

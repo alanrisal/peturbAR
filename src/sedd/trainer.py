@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, Callable, Tuple
 from pathlib import Path
 import json
 from tqdm import tqdm
-
+import numpy as np
 from .graph import Graph, AbsorbingGraph
 from .noise import NoiseSchedule
 
@@ -56,12 +56,7 @@ class SEDDTrainer:
         self.best_loss = float("inf")
         self.history = {"train_loss": [], "val_loss": []}
 
-    def compute_loss(
-        self,
-        x_clean: Tensor,
-        mask_ratio: float = 0.15,
-    ) -> Tensor:
-
+    def compute_loss(self, x_clean: Tensor, mask_ratio: float = 0.15) -> Tensor:
         batch_size, seq_len = x_clean.shape
         device = x_clean.device
 
@@ -73,21 +68,8 @@ class SEDDTrainer:
         else:
             x_noised = self.graph.sample_transition(x_clean, sigma)
 
-        # Wrap forward pass in autocast for mixed precision
         with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-            pred_score = self.model.score(x_noised, sigma)
-
-            mask_idx = getattr(self.graph, 'mask_index', self.graph.num_states - 1)
-            is_masked = (x_noised == mask_idx)
-
-            if not is_masked.any():
-                return torch.tensor(0.0, device=device, requires_grad=True)
-
-            pred_at_mask = pred_score[is_masked]
-            target_at_mask = x_clean[is_masked]
-
-            loss = F.cross_entropy(pred_at_mask, target_at_mask, reduction='sum') / batch_size
-
+            loss = self.model.get_loss(x_clean, x_noised, sigma, self.graph)
         return loss
 
     def _mask_tokens(
@@ -390,6 +372,7 @@ class PerturbationTrainer:
         perturbed: Tensor,
         mask_ratio: float = 0.15,
         cell_type_labels: Optional[Tensor] = None,
+        x_control: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Compute perturbation prediction loss.
@@ -427,6 +410,7 @@ class PerturbationTrainer:
                 pert_labels=pert_labels,
                 graph=self.graph,
                 cell_type_labels=cell_type_labels,
+                x_control=x_control,
             )
 
         return loss
@@ -466,6 +450,7 @@ class PerturbationTrainer:
 
         # Unpack batch - handle cell-load dictionary format
         cell_type_labels = None
+        control = None
         if isinstance(batch, dict):
             # Cell-load batch format
             perturbed = batch['pert_cell_emb'].to(self.device)
@@ -492,7 +477,8 @@ class PerturbationTrainer:
                 pert_labels = pert_emb.squeeze(-1).long()
         else:
             # Legacy tuple format: (pert_labels, perturbed)
-            pert_labels, perturbed = batch
+            control, pert_labels, perturbed = batch
+            control = control.to(self.device)
             pert_labels = pert_labels.to(self.device)
             perturbed = perturbed.to(self.device)
 
@@ -509,7 +495,7 @@ class PerturbationTrainer:
         perturbed = torch.round(perturbed).long()
 
         # Compute loss with cell type conditioning
-        loss = self.compute_loss(pert_labels, perturbed, mask_ratio, cell_type_labels)
+        loss = self.compute_loss(pert_labels, perturbed, mask_ratio, cell_type_labels, x_control=control)
 
         # Backward pass with gradient scaling for mixed precision
         if self.scaler is not None:
@@ -611,6 +597,7 @@ class PerturbationTrainer:
         for batch in val_loader:
             # Unpack batch - handle cell-load dictionary format
             cell_type_labels = None
+            control = None
             if isinstance(batch, dict):
                 # Cell-load batch format
                 perturbed = batch['pert_cell_emb'].to(self.device)
@@ -637,6 +624,7 @@ class PerturbationTrainer:
             else:
                 # Legacy tuple format: (control, pert_labels, perturbed)
                 control, pert_labels, perturbed = batch
+                control = control.to(self.device)
                 pert_labels = pert_labels.to(self.device)
                 perturbed = perturbed.to(self.device)
 
@@ -654,7 +642,7 @@ class PerturbationTrainer:
 
             # Use autocast for validation too
             with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                loss = self.compute_loss(pert_labels, perturbed, mask_ratio, cell_type_labels)
+                loss = self.compute_loss(pert_labels, perturbed, mask_ratio, cell_type_labels, x_control=control)
             total_loss += loss.item()
             num_batches += 1
 
@@ -673,8 +661,9 @@ class PerturbationTrainer:
         callback: Optional[Callable] = None,
     ) -> Dict[str, Any]:
 
-        checkpoint_dir = Path(checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if checkpoint_dir:
+            checkpoint_dir = Path(checkpoint_dir)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Start from current epoch if resuming from checkpoint
         start_epoch = self.epoch
@@ -761,3 +750,6 @@ class PerturbationTrainer:
 
         if self.scheduler and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])  
+
+
+            
