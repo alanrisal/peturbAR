@@ -3,7 +3,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import graph_lib
-from model import utils as mutils
+from sedd1.model import utils as mutils
 
 
 def get_loss_fn(noise, graph, train, sampling_eps=1e-3, lv=False):
