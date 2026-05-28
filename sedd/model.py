@@ -897,6 +897,8 @@ class SEDDPerturbationTransformerSeparateFiLM(nn.Module):
             CrossAttentionConditioningBlock(hidden_dim, num_heads, dropout)
             for _ in range(num_layers)
         ])
+        # Gate cross-attention influence near-zero at init, same pattern as ctrl_gate
+        self.cross_attn_gate = nn.Parameter(torch.full((1,), -5.0))
 
 # --- NEW: optional GRN attention bias (set after init via register_buffer) ---
         self.register_buffer('attn_bias', None, persistent=True)
@@ -968,11 +970,12 @@ class SEDDPerturbationTransformerSeparateFiLM(nn.Module):
             pert_ctx = pert_cond + cell_type_cond
 
         # Transformer blocks
+        cross_gate = torch.sigmoid(self.cross_attn_gate)
         for block, cross_attn in zip(self.blocks, self.cross_attn_blocks):
             # Self-attention with FiLM + optional GRN bias
             h = block(h, time_cond, pert_cond, cell_type_cond, mask, self.attn_bias)
-            # Cross-attention: each gene queries the perturbation context
-            h = h + cross_attn(h, pert_ctx)
+            # Cross-attention: each gene queries the perturbation context (gated near-zero at init)
+            h = h + cross_gate * cross_attn(h, pert_ctx)
 
         h = self.out_norm(h, time_cond, pert_cond, cell_type_cond)
         logits = self.out_proj(h)

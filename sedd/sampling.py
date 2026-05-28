@@ -129,7 +129,8 @@ class EulerSampler(Sampler):
         if not is_masked.any():
             return x
 
-        probs = F.softmax(score / self.temperature, dim=-1)
+        # Exclude mask token so it cannot be sampled during intermediate steps
+        clean_probs = F.softmax(score[..., :-1] / self.temperature, dim=-1)
 
         p_stay = torch.exp(-dsigma)
 
@@ -137,11 +138,9 @@ class EulerSampler(Sampler):
         do_unmask = torch.rand_like(unmask_prob) < unmask_prob
 
         new_tokens = torch.multinomial(
-            probs.view(-1, probs.size(-1)),
+            clean_probs.view(-1, clean_probs.size(-1)),
             num_samples=1
         ).view(batch_size, seq_len)
-
-        new_tokens = new_tokens.clamp(max=mask_idx - 1)
 
         x_new = torch.where(do_unmask, new_tokens, x)
 
@@ -257,7 +256,8 @@ class PerturbationEulerSampler(Sampler):
         if not is_masked.any():
             return x
 
-        probs = F.softmax(score / self.temperature, dim=-1)
+        # Exclude mask token so it cannot be sampled during intermediate steps
+        clean_probs = F.softmax(score[..., :-1] / self.temperature, dim=-1)
 
         p_stay = torch.exp(-dsigma)
 
@@ -265,11 +265,9 @@ class PerturbationEulerSampler(Sampler):
         do_unmask = torch.rand_like(unmask_prob) < unmask_prob
 
         new_tokens = torch.multinomial(
-            probs.view(-1, probs.size(-1)),
+            clean_probs.view(-1, clean_probs.size(-1)),
             num_samples=1
         ).view(batch_size, seq_len)
-
-        new_tokens = new_tokens.clamp(max=mask_idx - 1)
 
         x_new = torch.where(do_unmask, new_tokens, x)
 
