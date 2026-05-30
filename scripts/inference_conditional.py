@@ -653,9 +653,23 @@ def main():
         obs_dict['cell_type'] = [args.cell_type] * len(all_generated)
         obs_dict['cell_type_idx'] = [cell_type_idx] * len(all_generated)
     
+    # Load gene names saved by run_tonight.py so that evaluate_metrics.py
+    # can align columns between generated and test h5ad files.
+    gene_names_file = experiment_dir / "genes.json"
+    if gene_names_file.exists():
+        with open(gene_names_file) as _f:
+            gene_names = json.load(_f)
+        import pandas as pd
+        var_df = pd.DataFrame(index=gene_names)
+    else:
+        print("WARNING: genes.json not found in experiment_dir — "
+              "var_names will be integers. Evaluation gene alignment will fail.")
+        var_df = None
+
     adata_generated = sc.AnnData(
         X=all_generated.numpy(),
-        obs=obs_dict
+        obs=obs_dict,
+        var=var_df,
     )
     adata_generated.write_h5ad(output_dir / "generated_cells.h5ad")
 

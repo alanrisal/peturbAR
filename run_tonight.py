@@ -11,7 +11,7 @@ from sedd.graph import AbsorbingGraph
 from sedd.noise import LogLinearNoise  # check noise.py for exact class name
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_PATH      = '/workspace/data/replogle_k562_essential/perturb_processed.h5ad'
+DATA_PATH      = '/workspace/data/k562_essential_processed.h5ad'
 CHECKPOINT_DIR = '/workspace/checkpoints/k562_crossattn'
 NUM_GENES      = 2000
 NUM_BINS       = 51       # 0..50 expression levels + mask token at 51
@@ -24,10 +24,20 @@ CONTROL_NAME   = 'non-targeting'  # update if your print above showed different
 print("Loading data...")
 adata = sc.read_h5ad(DATA_PATH)
 
-# Filter to highly variable genes
-sc.pp.highly_variable_genes(adata, n_top_genes=NUM_GENES, flavor='seurat_v3')
+# Filter to highly variable genes.
+# flavor='seurat' works on log1p-normalized data (which Replogle Figshare files are).
+# Use flavor='seurat_v3' only if adata.X contains raw integer counts.
+sc.pp.highly_variable_genes(adata, n_top_genes=NUM_GENES, flavor='seurat')
 adata = adata[:, adata.var.highly_variable]
 print(f"After HVG filter: {adata.shape}")
+
+# Save HVG gene names so inference and eval can align gene columns
+GENE_NAMES = list(adata.var_names)
+import json as _json
+Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+with open(Path(CHECKPOINT_DIR) / "genes.json", "w") as _f:
+    _json.dump(GENE_NAMES, _f)
+print(f"Saved {len(GENE_NAMES)} gene names to {CHECKPOINT_DIR}/genes.json")
 
 # Bin to discrete tokens
 X = adata.X.toarray() if hasattr(adata.X, 'toarray') else np.array(adata.X)
