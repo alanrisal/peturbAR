@@ -68,7 +68,7 @@ class SEDDTrainer:
         else:
             x_noised = self.graph.sample_transition(x_clean, sigma)
 
-        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             loss = self.model.get_loss(x_clean, x_noised, sigma, self.graph)
         return loss
 
@@ -147,7 +147,7 @@ class SEDDTrainer:
             batch = batch.to(self.device)
             
             # Use autocast for validation too
-            with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                 loss = self.compute_loss(batch, mask_ratio)
             total_loss += loss.item()
             num_batches += 1
@@ -246,8 +246,20 @@ class SEDDTrainer:
 
     def load_checkpoint(self, path: str, load_optimizer: bool = True):
         checkpoint = torch.load(path, map_location=self.device)
+        state_dict = checkpoint["model_state_dict"]
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        # attn_bias is a registered buffer that starts as None in __init__.
+        # PyTorch omits None buffers from state_dict(), so strict loading
+        # sees it as an unexpected key. Load with strict=False then restore it.
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        non_bias_unexpected = [k for k in unexpected if k != "attn_bias"]
+        if non_bias_unexpected:
+            raise RuntimeError(f"Unexpected keys in checkpoint: {non_bias_unexpected}")
+        if missing:
+            print(f"Warning: missing keys in checkpoint (may be expected): {missing}")
+        if "attn_bias" in state_dict:
+            self.model.register_buffer("attn_bias", state_dict["attn_bias"].to(self.device))
+
         self.step = checkpoint.get("step", 0)
         self.epoch = checkpoint.get("epoch", 0)
         self.best_loss = checkpoint.get("best_loss", float("inf"))
@@ -402,7 +414,7 @@ class PerturbationTrainer:
 
         # Model predicts perturbed from noised + perturbation label + cell type
         # Wrap forward pass in autocast for mixed precision
-        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             loss = self.model.get_loss(
                 x_perturbed=perturbed,
                 x_noised=x_noised,
@@ -641,7 +653,7 @@ class PerturbationTrainer:
             perturbed = torch.round(perturbed).long()
 
             # Use autocast for validation too
-            with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                 loss = self.compute_loss(pert_labels, perturbed, mask_ratio, cell_type_labels, x_control=control)
             total_loss += loss.item()
             num_batches += 1
@@ -738,8 +750,17 @@ class PerturbationTrainer:
 
     def load_checkpoint(self, path: str, load_optimizer: bool = True):
         checkpoint = torch.load(path, map_location=self.device)
+        state_dict = checkpoint["model_state_dict"]
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        non_bias_unexpected = [k for k in unexpected if k != "attn_bias"]
+        if non_bias_unexpected:
+            raise RuntimeError(f"Unexpected keys in checkpoint: {non_bias_unexpected}")
+        if missing:
+            print(f"Warning: missing keys in checkpoint (may be expected): {missing}")
+        if "attn_bias" in state_dict:
+            self.model.register_buffer("attn_bias", state_dict["attn_bias"].to(self.device))
+
         self.step = checkpoint.get("step", 0)
         self.epoch = checkpoint.get("epoch", 0)
         self.best_loss = checkpoint.get("best_loss", float("inf"))
@@ -749,7 +770,7 @@ class PerturbationTrainer:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         if self.scheduler and "scheduler_state_dict" in checkpoint:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])  
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
 
             

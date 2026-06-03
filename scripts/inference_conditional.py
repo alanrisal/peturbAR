@@ -15,6 +15,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sedd.model import (
     SEDDPerturbationTransformerSmall,
+    SEDDPerturbationTransformerSeparateFiLMSmall,
+    SEDDPerturbationTransformerSeparateFiLMMedium,
+    SEDDPerturbationTransformerSeparateFiLMLarge,
 )
 from sedd.graph import AbsorbingGraph
 from sedd.noise import LogLinearNoise
@@ -26,6 +29,9 @@ from sedd.sampling import PerturbationEulerSampler
 # Model registry for easy instantiation by name
 MODEL_REGISTRY = {
     "SEDDPerturbationTransformerSmall": SEDDPerturbationTransformerSmall,
+    "SEDDPerturbationTransformerSeparateFiLMSmall": SEDDPerturbationTransformerSeparateFiLMSmall,
+    "SEDDPerturbationTransformerSeparateFiLMMedium": SEDDPerturbationTransformerSeparateFiLMMedium,
+    "SEDDPerturbationTransformerSeparateFiLMLarge": SEDDPerturbationTransformerSeparateFiLMLarge,
 }
 
 import yaml
@@ -57,7 +63,7 @@ def load_conditional_labels(pt_path, pert_names):
         missing_perts: List of perturbations not found in .pt file
         total_label_space: int, the total number of labels in the .pt file
     """
-    if pt_path is None:
+    if not pt_path:  # handles None and empty string from yaml null default
         return None, [], 0
 
     print(f"\nLoading conditional labels from: {pt_path}")
@@ -333,41 +339,56 @@ def parse_args():
 
 def load_perturbation_labels(args, control_name="non-targeting"):
     """
-    1. Loads the master list of perturbations (from .pt mapping if provided).
-    2. Assigns indices (Control=0, others=1, 2, 3...).
-    3. Returns only the subset requested in args.perturbation_file.
+    Build the perturbation name → index mapping that matches what was used during
+    training, then return only the subset listed in args.perturbations_file.
+
+    Priority:
+      1. pert_to_idx.json in experiment_dir  — exact mapping saved at training time
+         (PerturbSeqDataset uses sorted(set(labels)), so non-targeting sorts last,
+         NOT first; the old "control=0, others=1,2,3" scheme was wrong for this).
+      2. cond_labels_pt_path (.pt protein embeddings) — index into lookup tensor.
+      3. perturbations_all_file              — positional order used as-is.
     """
-    if args.cond_labels_pt_path:
+    # ── Option 1: exact JSON mapping saved by run_tonight.py ──────────────────
+    pert_mapping_json = Path(args.experiment_dir) / "pert_to_idx.json"
+    if pert_mapping_json.exists():
+        with open(pert_mapping_json) as f:
+            full_mapping = json.load(f)
+        print(f"Loaded exact pert_to_idx mapping from {pert_mapping_json} "
+              f"({len(full_mapping)} perturbations)")
+
+    # ── Option 2: protein embedding .pt file ──────────────────────────────────
+    elif args.cond_labels_pt_path:
         pt_data = torch.load(args.cond_labels_pt_path, map_location="cpu")
         if not isinstance(pt_data, dict):
             raise TypeError(
                 f"Expected dict in {args.cond_labels_pt_path}, got {type(pt_data)}"
             )
         total_pert_names = list(pt_data.keys())
+        others = [p for p in total_pert_names if p != control_name]
+        full_mapping = {control_name: 0}
+        for i, pert in enumerate(others):
+            full_mapping[pert] = i + 1
+
+    # ── Option 3: plain text file — use positional order directly ─────────────
     else:
-        # Load the master list (all perturbations used during training)
-        # This list MUST be in the exact same order as used in training
         total_pert_names = load_perturbations_from_file(args.perturbations_all_file)
+        others = [p for p in total_pert_names if p != control_name]
+        full_mapping = {control_name: 0}
+        for i, pert in enumerate(others):
+            full_mapping[pert] = i + 1
+        print("WARNING: no pert_to_idx.json found — using positional order from "
+              "all_perts.txt. Indices may not match training if the file order "
+              "differs from sorted(set(labels)).")
 
-    # Load the specific subset you want to generate now
+    # Load the specific subset to generate and map to (name, index) tuples
     target_pert_names = load_perturbations_from_file(args.perturbations_file)
-
-    # 1 & 2. Recreate the mapping logic: Control is 0, others are +1
-    # We remove the control from the loop to ensure it always gets index 0
-    others = [p for p in total_pert_names if p != control_name]
-
-    full_mapping = {control_name: 0}
-    for i, pert in enumerate(others):
-        full_mapping[pert] = i + 1
-
-    # 3. Filter for the requested perturbations and package as list of tuples
     perturbations = []
     for pert in target_pert_names:
         if pert in full_mapping:
-            # Packaging as (name, index) to match your generation loop
             perturbations.append((pert, full_mapping[pert]))
         else:
-            print(f"Warning: Requested perturbation '{pert}' was not found in the master list.")
+            print(f"Warning: '{pert}' not found in mapping — skipping.")
 
     print(f"Loaded {len(perturbations)} perturbations for generation.")
     return perturbations
@@ -451,11 +472,9 @@ def main():
             if NUM_PERTURBATIONS is None or NUM_PERTURBATIONS != ckpt_num_perts:
                 NUM_PERTURBATIONS = ckpt_num_perts
                 print(f"Overriding NUM_PERTURBATIONS from checkpoint: {NUM_PERTURBATIONS}")
-        if "gene_embed.weight" in state_dict:
-            ckpt_num_genes = state_dict["gene_embed.weight"].shape[0]
-            if NUM_GENES is None or NUM_GENES != ckpt_num_genes:
-                NUM_GENES = ckpt_num_genes
-                print(f"Overriding NUM_GENES from checkpoint: {NUM_GENES}")
+        # gene_embed is sized by max_seq_len (default 4096), NOT by the actual
+        # number of genes used in training. Never read NUM_GENES from it —
+        # use args.json (num_genes: 2000) which records the real training value.
         # Detect if checkpoint has precomputed projection layer
         if "precomputed_proj.weight" in state_dict:
             checkpoint_precomputed_dim = state_dict["precomputed_proj.weight"].shape[1]
@@ -540,6 +559,10 @@ def main():
 
     ModelClass = MODEL_REGISTRY[model_name]
     print(f"\nCreating {model_name} model...")
+    # max_seq_len must match what was used at training time (controls gene_embed size).
+    # If not in args.json it defaults to the class default (4096) — which is what
+    # old checkpoints trained without explicit max_seq_len will have.
+    max_seq_len = train_config.get("max_seq_len", 4096)
     model = ModelClass(
         num_genes=NUM_GENES,
         num_bins=NUM_BINS,
@@ -548,7 +571,7 @@ def main():
         num_layers=train_config.get("num_layers", 4),
         num_heads=train_config.get("num_heads", 4),
         dropout=train_config.get("dropout", 0.1),
-        max_seq_len=NUM_GENES,
+        max_seq_len=max_seq_len,
         precomputed_emb_dim=precomputed_emb_dim,
         num_cell_types=NUM_CELL_TYPES if NUM_CELL_TYPES > 0 else None
     ).to(device)
@@ -592,6 +615,13 @@ def main():
         amp_dtype=amp_dtype
     )
 
+    # How many samples to generate in a single batched forward pass.
+    # All num_samples_per_pert cells share the same perturbation label, so we
+    # can stack them into one batch and run the diffusion loop once instead of
+    # num_samples_per_pert times. Reduces 10,000 serial GPU launches to 100.
+    # Lower this only if you hit OOM (unlikely: 100×2000 seq uses ~500 MB with FA).
+    SAMPLE_BATCH_SIZE = min(args.num_samples_per_pert, 100)
+
     # Storage for generated cells
     all_generated = []
     all_pert_indices = []
@@ -599,30 +629,47 @@ def main():
 
     with torch.no_grad():
         for pert_name, pert_idx in tqdm(perturbations, desc="Generating"):
-            for sample_idx in range(args.num_samples_per_pert):
-                x_init = torch.full((1, NUM_GENES),fill_value=graph.mask_index,dtype=torch.long,device=device)
+            # Create perturbation label tensor and repeat for the whole batch
+            pert_label_single = torch.tensor([pert_idx], dtype=torch.long, device=device)
+            pert_label_single = trainer._apply_cond_label_lookup(pert_label_single)
 
-                # Create perturbation label tensor
-                pert_label = torch.tensor([pert_idx], dtype=torch.long, device=device)
+            cell_type_label = None
+            if cell_type_idx is not None:
+                cell_type_label = torch.tensor([cell_type_idx], dtype=torch.long, device=device)
 
-                # Apply conditional label lookup if available (converts index to precomputed embedding)
-                pert_label = trainer._apply_cond_label_lookup(pert_label)
+            remaining = args.num_samples_per_pert
+            while remaining > 0:
+                bs = min(remaining, SAMPLE_BATCH_SIZE)
+                remaining -= bs
 
-                # Create cell type label tensor if specified
-                cell_type_label = None
-                if cell_type_idx is not None:
-                    cell_type_label = torch.tensor([cell_type_idx], dtype=torch.long, device=device)
+                x_init = torch.full(
+                    (bs, NUM_GENES),
+                    fill_value=graph.mask_index,
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                # Broadcast the single perturbation label across the batch
+                if pert_label_single.dim() == 1:
+                    pert_label_batch = pert_label_single.expand(bs)
+                else:
+                    # Vector embedding (precomputed): repeat along batch dim
+                    pert_label_batch = pert_label_single.expand(bs, -1)
+
+                ct_batch = None
+                if cell_type_label is not None:
+                    ct_batch = cell_type_label.expand(bs)
 
                 generated = sampler.sample(
                     x_init,
-                    pert_labels=pert_label,
-                    cell_type_labels=cell_type_label,
-                    show_progress=False
+                    pert_labels=pert_label_batch,
+                    cell_type_labels=ct_batch,
+                    show_progress=False,
                 )
-                
+
                 all_generated.append(generated.cpu())
-                all_pert_indices.append(pert_idx)
-                all_pert_names.append(pert_name)
+                all_pert_indices.extend([pert_idx] * bs)
+                all_pert_names.extend([pert_name] * bs)
 
     all_generated = torch.cat(all_generated, dim=0)  # [num_total_samples, num_genes]
     print(f"\nGenerated {len(all_generated)} cells total")
@@ -694,16 +741,35 @@ def main():
 
     # Visualizations
     print("\nGenerating visualizations...")
-    
-    # 1. Distribution of expression values
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    
-    axes[0].hist(all_generated.flatten().numpy(), bins=50, alpha=0.7)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: overall distribution of generated expression bins
+    axes[0].hist(all_generated.flatten().numpy(), bins=50, alpha=0.7, color='steelblue')
     axes[0].set_xlabel('Expression Bin')
     axes[0].set_ylabel('Count')
     axes[0].set_title('Distribution of Generated Expression Values')
-    
-    
+
+    # Right: mean expression per perturbation (one bar per val perturbation)
+    pert_means = []
+    pert_labels_plot = []
+    for pert_name, pert_idx in perturbations:
+        mask = np.array(all_pert_indices) == pert_idx
+        cells = all_generated[mask].float()
+        pert_means.append(cells.mean().item())
+        pert_labels_plot.append(pert_name)
+
+    axes[1].bar(range(len(pert_means)), sorted(pert_means), color='salmon', alpha=0.8)
+    axes[1].set_xlabel('Perturbation (sorted by mean expression)')
+    axes[1].set_ylabel('Mean Expression Bin')
+    axes[1].set_title(f'Mean Expression per Perturbation (n={len(pert_means)})')
+    axes[1].set_xticks([])  # too many labels to show
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "generation_summary.png", dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved visualization to {output_dir / 'generation_summary.png'}")
+
     print_success(output_dir)
 
 

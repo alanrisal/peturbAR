@@ -10,20 +10,33 @@ from sklearn.metrics.pairwise import rbf_kernel
 NUM_BINS = 51
 
 
-def bin_expression(X, num_bins=NUM_BINS):
-    """Apply the same discretization used during training.
+def normalize_and_bin(X, num_bins=NUM_BINS):
+    """Apply the same preprocessing used during training.
 
-    Generated cells are saved as integer bin indices in [0, num_bins - 1].
-    The test h5ad contains raw expression counts, so we must apply the
-    identical binning before any distance comparison — otherwise the two
-    distributions live on completely different scales and metrics like W2
-    become meaningless (e.g. W2 ~ 4000 in a 50-dim space where the
-    theoretical max with both sides in [0, 50] is ~354).
+    Training pipeline (run_tonight.py):
+      1. normalize_total(target_sum=1e4)  — equalize sequencing depth per cell
+      2. log1p                            — compress dynamic range; values → [0, ~8]
+      3. np.round + clip to [0, num_bins-1] — discretize to tokens
+
+    Generated cells are already token indices (steps 1-3 already applied).
+    Test h5ad contains raw counts (max ~210), so we must apply all three steps
+    before comparing — otherwise W2 is computed across incompatible scales.
     """
     if hasattr(X, 'toarray'):
-        X = X.toarray()
+        X = X.toarray().astype(np.float32)
     else:
-        X = np.asarray(X)
+        X = np.asarray(X, dtype=np.float32)
+
+    # Detect whether normalization is still needed (generated cells are already
+    # small integers [0, num_bins-1]; raw counts have much higher max values).
+    if X.max() > num_bins:
+        # normalize_total: scale each cell to target_sum=1e4
+        cell_sums = X.sum(axis=1, keepdims=True)
+        cell_sums = np.where(cell_sums == 0, 1, cell_sums)  # avoid div-by-zero
+        X = X / cell_sums * 1e4
+        # log1p
+        X = np.log1p(X)
+
     return np.clip(np.round(X).astype(np.int32), 0, num_bins - 1)
 
 
@@ -53,12 +66,42 @@ def compute_w2(X, Y):
 
 
 def evaluate(generated_h5ad, test_h5ad, pert_col='perturbation',
-             n_subsample=1000, n_top_genes=50, num_bins=NUM_BINS):
+             test_pert_col=None, n_subsample=1000, n_top_genes=50, num_bins=NUM_BINS):
+    """
+    Args:
+        pert_col:      obs column name in the GENERATED h5ad  (default: 'perturbation')
+        test_pert_col: obs column name in the TEST h5ad.
+                       Defaults to pert_col when not set, but the raw Replogle
+                       file uses 'gene' while generated cells use 'perturbation',
+                       so pass test_pert_col='gene' when evaluating against it.
+    """
+    if test_pert_col is None:
+        test_pert_col = pert_col
+
     gen = sc.read_h5ad(generated_h5ad)
     test = sc.read_h5ad(test_h5ad)
 
-    # --- Gene alignment: generated cells only have the HVGs used at training time.
-    # If the test h5ad has more genes, subset it to the same gene set in the same order.
+    # --- Normalize test BEFORE gene alignment ---
+    # Critical ordering: training did normalize_total(all 8563 genes) → log1p → HVG subset.
+    # If we subset genes first and then normalize, we normalize over ~2000 genes instead of
+    # 8563, inflating values by ~4x (HVGs carry only ~25% of total counts).
+    # Generated cells are already binned tokens — normalize_and_bin is a no-op for them.
+    gen_X_raw = gen.X.toarray() if hasattr(gen.X, 'toarray') else np.asarray(gen.X, dtype=np.float32)
+    test_X_raw = test.X.toarray() if hasattr(test.X, 'toarray') else np.asarray(test.X, dtype=np.float32)
+
+    print(f"[pre-bin] Generated X range: {gen_X_raw.min():.3f} .. {gen_X_raw.max():.3f}")
+    print(f"[pre-bin] Test X range:      {test_X_raw.min():.3f} .. {test_X_raw.max():.3f}")
+
+    gen_binned = normalize_and_bin(gen_X_raw, num_bins=num_bins)
+    # Normalize test over the FULL gene set before subsetting
+    if test_X_raw.max() > num_bins:
+        cell_sums = test_X_raw.sum(axis=1, keepdims=True)
+        cell_sums = np.where(cell_sums == 0, 1, cell_sums)
+        test_X_norm = np.log1p(test_X_raw / cell_sums * 1e4)
+        test = sc.AnnData(X=test_X_norm, obs=test.obs.copy(), var=test.var.copy())
+        test_X_raw = test_X_norm  # update for post-bin print below
+
+    # --- Gene alignment (after normalization) ---
     if gen.var is not None and len(gen.var) > 0 and gen.n_vars != test.n_vars:
         shared_genes = [g for g in gen.var_names if g in test.var_names]
         if len(shared_genes) == 0:
@@ -74,27 +117,17 @@ def evaluate(generated_h5ad, test_h5ad, pert_col='perturbation',
     elif gen.n_vars != test.n_vars:
         raise ValueError(
             f"Generated has {gen.n_vars} genes, test has {test.n_vars} genes, "
-            f"and generated h5ad has no var_names to align by. "
-            f"Re-run inference and make sure gene names are saved into the h5ad."
+            f"and generated h5ad has no var_names to align by."
         )
 
-    # --- Sanity check: confirm scale mismatch is resolved ---
-    gen_X_raw = gen.X.toarray() if hasattr(gen.X, 'toarray') else np.asarray(gen.X)
-    test_X_raw = test.X.toarray() if hasattr(test.X, 'toarray') else np.asarray(test.X)
-    print(f"[pre-bin] Generated X range: {gen_X_raw.min():.3f} .. {gen_X_raw.max():.3f}")
-    print(f"[pre-bin] Test X range:      {test_X_raw.min():.3f} .. {test_X_raw.max():.3f}")
-
-    # Apply identical binning to BOTH sides. Generated is already binned
-    # (idempotent for ints already in range); test is raw and must be
-    # discretized to match.
-    gen_binned = bin_expression(gen_X_raw, num_bins=num_bins)
-    test_binned = bin_expression(test_X_raw, num_bins=num_bins)
+    # Bin the (now-aligned) test expression
+    test_X_aligned = test.X.toarray() if hasattr(test.X, 'toarray') else np.asarray(test.X)
+    test_binned = np.clip(np.round(test_X_aligned).astype(np.int32), 0, num_bins - 1)
 
     print(f"[post-bin] Generated X range: {gen_binned.min()} .. {gen_binned.max()}")
     print(f"[post-bin] Test X range:      {test_binned.min()} .. {test_binned.max()}")
 
-    # Rebuild AnnData objects so the obs/var alignment stays correct when
-    # we index by perturbation below.
+    # Rebuild AnnData with binned values
     gen = sc.AnnData(X=gen_binned, obs=gen.obs.copy(), var=gen.var.copy())
     test = sc.AnnData(X=test_binned, obs=test.obs.copy(), var=test.var.copy())
 
@@ -103,7 +136,7 @@ def evaluate(generated_h5ad, test_h5ad, pert_col='perturbation',
 
     for pert in perturbations:
         gen_cells = gen[gen.obs[pert_col] == pert].X
-        test_cells = test[test.obs[pert_col] == pert].X
+        test_cells = test[test.obs[test_pert_col] == pert].X
 
         # X is now a dense ndarray after the rebuild, but guard anyway.
         if hasattr(gen_cells, 'toarray'):
@@ -142,9 +175,10 @@ def evaluate(generated_h5ad, test_h5ad, pert_col='perturbation',
 if __name__ == "__main__":
     import sys
     results = evaluate(
-        generated_h5ad=sys.argv[1],         # inference_results/generated_cells.h5ad
-        test_h5ad=sys.argv[2],              # datasets/replogle_k562_test.h5ad
-        pert_col='perturbation',
+        generated_h5ad=sys.argv[1],   # e.g. /workspace/checkpoints/k562_crossattn/inference_results/generated_cells.h5ad
+        test_h5ad=sys.argv[2],        # e.g. /workspace/data/k562_essential_processed.h5ad
+        pert_col='perturbation',      # column name in generated h5ad
+        test_pert_col='gene',         # column name in raw Replogle h5ad
         n_subsample=500,
         n_top_genes=50,
         num_bins=NUM_BINS,

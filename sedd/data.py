@@ -125,9 +125,11 @@ class PerturbSeqDataset(Dataset):
             num_bins: Number of expression bins
             control_pert_name: Name of control perturbation in pert_labels
         """
-        # Convert to tensors
+        # Store as int8 to keep resident RAM ~8x smaller than int64.
+        # __getitem__ converts to long (int64) per-batch, which costs only ~1 MB
+        # per batch instead of materialising a full int64 copy of the whole matrix.
         if not isinstance(expression, Tensor):
-            expression = torch.from_numpy(expression).long()
+            expression = torch.from_numpy(np.asarray(expression))  # keeps int8, zero-copy
         self.expression = expression
 
         self.num_cells, self.num_genes = expression.shape
@@ -160,7 +162,7 @@ class PerturbSeqDataset(Dataset):
         # Handle control expression
         if control_expression is not None:
             if not isinstance(control_expression, Tensor):
-                control_expression = torch.from_numpy(control_expression).long()
+                control_expression = torch.from_numpy(np.asarray(control_expression))  # keeps int8
             self.control_expression = control_expression
             self.has_separate_controls = True
         else:
@@ -220,12 +222,13 @@ class PerturbSeqDataset(Dataset):
             perturbed: Perturbed cell expression [num_genes]
         """
         # Get perturbed cell and its label
-        perturbed = self.expression[idx]
+        # .long() here converts int8 → int64 only for this one sample (~2k ints).
+        perturbed = self.expression[idx].long()
         pert_label = self.pert_labels[idx]
 
         # Sample a random control cell
         control_idx = torch.randint(0, len(self.control_expression), (1,)).item()
-        control = self.control_expression[control_idx]
+        control = self.control_expression[control_idx].long()
 
         return control, pert_label, perturbed
 

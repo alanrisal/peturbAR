@@ -9,14 +9,14 @@ model:
 
 # Data parameters
 data:
-  train_data_path: datasets/1M/1m_train_processed.h5ad # Must be specified via CLI or environment variable
-  gene: cytokine  # Column in adata.obs with perturbation labels
-  control_name: PBS # Name of control perturbation
+  train_data_path: null  # set via CLI: /workspace/data/k562_essential_processed.h5ad
+  gene: gene             # obs column with perturbation labels (Replogle K562)
+  control_name: non-targeting
   val_fraction: 0.1
-  loader_path: examples/cytokine_config.toml
-  cond_labels_pt_path: datasets/1M/cytokines.pt
-  all_perturbations_file: datasets/1M/all_cytokines.txt
-  data_path: datasets/1M/1m_test.h5ad
+  loader_path: null
+  cond_labels_pt_path: null  # no protein embeddings for K562 run
+  all_perturbations_file: null
+  data_path: null
 
 # Training hyperparameters
 training:
@@ -49,15 +49,14 @@ inference:
   mask_ratio: 0.2
   num_steps: 100
   temperature: 1.0
-  sampler: analytic
+  sampler: euler
   batch_size: 512
-  num_batches: null  # null means all batches
+  num_batches: null
   num_cells_visualize: 3
-  perturbations_file: datasets/1M/test_cytokines.txt
-  perturbations_all_file: datasets/1M/all_cytokines.txt
-  num_samples_per_pert: 100 # null means all batches
-  num_cells_visualize: 3
-  cell_type: "CD4 Naive"  # e.g., 'hepg2', 'jurkat', 'rpe1' - must match training data
+  perturbations_file: null      # set via CLI
+  perturbations_all_file: null  # set via CLI
+  num_samples_per_pert: 100
+  cell_type: null
 
 
 

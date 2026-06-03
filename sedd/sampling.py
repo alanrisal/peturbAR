@@ -105,7 +105,7 @@ class EulerSampler(Sampler):
         dsigma = self.noise.rate(t_tensor) * (-dt)  # dt is negative
 
         # Use autocast for faster inference
-        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             score = self.model.score(x, sigma)  # [batch, seq, vocab]
 
         if isinstance(self.graph, AbsorbingGraph):
@@ -233,7 +233,7 @@ class PerturbationEulerSampler(Sampler):
         dsigma = self.noise.rate(t_tensor) * (-dt)
 
         # Get score WITH perturbation and cell type conditioning (use autocast for faster inference)
-        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             score = self.model.score(x, sigma, pert_labels, cell_type_labels=cell_type_labels)
 
         if isinstance(self.graph, AbsorbingGraph):
@@ -298,7 +298,7 @@ class PerturbationEulerSampler(Sampler):
         sigma = torch.tensor([0.01], device=self.device)
         
         # Use autocast for faster inference
-        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             score = self.model.score(x, sigma, pert_labels, cell_type_labels=cell_type_labels)
 
         mask_idx = self.graph.mask_index if hasattr(self.graph, 'mask_index') else -1
